@@ -1,5 +1,15 @@
+// Take One — the entire browser game.
+//
+// Plain script (no modules, no bundler): everything here is a top-level
+// global function or const, loaded by index.html after ai-client.js. The
+// whole game is one mutable `state` object (see createDefaultState()/
+// loadState() below) rendered into #app-view / #dialog-content as HTML
+// template strings. See CLAUDE.md for the full file map and CONTEXT.md for
+// the game's design background.
+
 const STORAGE_KEY = "take-one-production-house-v1";
 
+// Genre → key-art image shown on film cards/dialogs.
 const images = {
   "Sci-Fi": "assets/glass-river.png",
   Mystery: "assets/asterion-signal.png",
@@ -350,6 +360,12 @@ const roleGigSource = {
   "VFX Artist": "vfx-orbit"
 };
 
+// The 4-stage Greenlight creative pipeline (Pre-production → Principal
+// photography → Post-production → Distribution). openProductionStage()
+// walks the player through these in order; each choice's `effect` (a rough
+// 3-8 quality contribution) accumulates into the production's final score,
+// and `fits` lists which genres get a bonus for that choice — see
+// openProductionStage() for how `effect`/`fits` are actually combined.
 const productionStages = [
   {
     name: "Pre-production",
@@ -397,6 +413,23 @@ const productionStages = [
   }
 ];
 
+// ------------------------------------------------------------------
+// State management
+//
+// The whole game lives in one mutable `state` object (see the module-level
+// `let state = loadState()` below), persisted to localStorage after nearly
+// every mutation via saveState(). There is no framework/store — callers
+// just mutate `state` in place and call saveState() when done.
+//
+// If you add a new field to game state, add its default here so
+// createDefaultState() stays the single source of truth for shape, and
+// loadState()'s `{ ...createDefaultState(), ...stored }` merge will
+// backfill it for existing players' saved state automatically. Only add
+// bespoke migration logic (like syncPortfolioAssetDrafts() below) when a
+// simple default merge isn't enough — e.g. deriving new fields from data
+// the player already earned.
+// ------------------------------------------------------------------
+
 function createDefaultState() {
   return {
     credits: 460,
@@ -418,6 +451,7 @@ function createDefaultState() {
     lastReleaseScore: 0,
     worldPrompts: [],
     promptCycle: -1,
+    walkCycle: -1,
     filmShots: {},
     filmVideos: {},
     playerName: "",
@@ -433,8 +467,13 @@ function createDefaultState() {
 function loadState() {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    // Shallow-merge onto fresh defaults so any field added to
+    // createDefaultState() since the player's last save is backfilled
+    // automatically, without a dedicated migration step.
     return stored ? { ...createDefaultState(), ...stored } : createDefaultState();
   } catch (error) {
+    // Corrupt/unparsable localStorage (or private-mode restrictions) —
+    // fail safe into a fresh game rather than throwing on load.
     return createDefaultState();
   }
 }
@@ -452,6 +491,12 @@ function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
+// Derives portfolio "asset drafts" (things the player can later publish/sell)
+// from gigs they've already aced. A gig qualifies once its best recorded
+// take (state.bestTakes[gigId]) scores 72+; this runs on every load so a
+// past high score keeps producing a draft even though the qualifying score
+// itself isn't re-earned. Idempotent — skips gigs that already produced an
+// owned asset or a pending draft.
 function syncPortfolioAssetDrafts() {
   Object.entries(assetWorkByGig).forEach(([gigId, assetWork]) => {
     const qualifies = (state.bestTakes[gigId] || 0) >= 72;
@@ -531,34 +576,88 @@ function toast(message) {
   window.setTimeout(() => item.remove(), 3600);
 }
 
+// HUD-only play: the game lives on the 3D lot. Every other "view" (gigs,
+// productions, catalog, assets, the career summary) opens as a panel over
+// the lot instead of a separate dashboard page, so old setView() calls
+// throughout this file keep working without leaving the world.
+let currentPanel = null;
+const panelTitles = {
+  studio: ["Front Office", "Your career"],
+  gigs: ["Crew Board", "Every open call"],
+  productions: ["Soundstage 1", "Your slate"],
+  catalog: ["Cinema", "The world catalog"],
+  assets: ["Prop House", "Reusable asset library"]
+};
+
+function openViewPanel(name) {
+  const [eyebrow, title] = panelTitles[name] || ["Studio", name];
+  openDialog(`
+    <div class="dialog-header"><div><p class="eyebrow">${eyebrow}</p><h2 id="dialog-title">${title}</h2></div><button type="button" class="close-button" data-close aria-label="Close">&times;</button></div>
+    <div class="dialog-body panel-view">${viewRenderers[name]()}</div>`);
+  currentPanel = name;
+  dialog.classList.add("dialog-wide");
+  dialog.addEventListener("close", () => { dialog.classList.remove("dialog-wide"); currentPanel = null; }, { once: true });
+  bindViewEvents(dialogContent);
+}
+
 function setView(nextView) {
+  if (nextView !== "lot" && viewRenderers[nextView]) {
+    if (currentView !== "lot") { currentView = "lot"; renderApp(); }
+    openViewPanel(nextView);
+    return;
+  }
   currentView = nextView;
   renderApp();
   window.scrollTo({ top: 0, behavior: "smooth" });
   view.focus({ preventScroll: true });
 }
 
+// ------------------------------------------------------------------
+// View rendering.
+//
+// Each render* function below builds a full HTML string for one nav
+// section and is called from the renderApp() dispatcher based on
+// `currentView`. There is no diffing/virtual DOM — every call replaces the
+// relevant container's innerHTML wholesale. Because listeners don't survive
+// an innerHTML replacement, any new interactive element added to a
+// template must also get a handler wired in bindViewEvents() (further
+// below), which re-runs after every render.
+// ------------------------------------------------------------------
+
 function renderApp() {
   const rank = getRank();
   document.getElementById("credit-balance").textContent = formatNumber(state.credits);
   document.getElementById("rep-balance").textContent = state.reputation;
   document.getElementById("role-label").textContent = rank.name;
+  document.getElementById("hud-rank").textContent = `${rank.tier} ${rank.name}`;
+  document.getElementById("hud-cycle").textContent = `Cycle ${String(state.cycle).padStart(2, "0")}`;
   document.getElementById("gig-count").textContent = availableGigCount();
 
   document.querySelectorAll("[data-view-target]").forEach(button => {
     button.classList.toggle("active", button.dataset.viewTarget === currentView);
   });
 
-  const renderers = {
-    studio: renderStudio,
-    gigs: renderGigs,
-    productions: renderProductions,
-    catalog: renderCatalog,
-    assets: renderAssets
-  };
-  view.innerHTML = renderers[currentView]();
+  // While walking a generated set, background re-renders (AI status, rewards)
+  // must not rebuild the view, or the set would restart and lose your takes.
+  const onSet = currentView === "lot" && typeof lot !== "undefined" && lot.activeSet && view.querySelector("#set-back");
+  if (onSet) return;
+  view.innerHTML = currentView === "lot" ? renderLot() : viewRenderers[currentView]();
   bindViewEvents();
+  if (currentView === "lot") mountLot();
+  // Keep an open panel in sync with state changes (filters, publishes...).
+  if (currentPanel && dialog.open) {
+    const body = dialogContent.querySelector(".panel-view");
+    if (body) { body.innerHTML = viewRenderers[currentPanel](); bindViewEvents(dialogContent); }
+  }
 }
+
+const viewRenderers = {
+  studio: () => renderStudio(),
+  gigs: () => renderGigs(),
+  productions: () => renderProductions(),
+  catalog: () => renderCatalog(),
+  assets: () => renderAssets()
+};
 
 function viewHeading(eyebrow, title, action = "") {
   return `
@@ -971,21 +1070,21 @@ function openPublishAsset() {
   });
 }
 
-function bindViewEvents() {
-  view.querySelectorAll("[data-view-link]").forEach(button => button.addEventListener("click", () => setView(button.dataset.viewLink)));
-  view.querySelectorAll("[data-gig-id]").forEach(button => button.addEventListener("click", () => openGig(button.dataset.gigId)));
-  view.querySelectorAll("[data-greenlight]").forEach(button => button.addEventListener("click", openGreenlight));
-  view.querySelectorAll("[data-live-watch]").forEach(button => button.addEventListener("click", openLiveSet));
-  view.querySelectorAll("[data-production-stage]").forEach(button => button.addEventListener("click", openProductionStage));
-  view.querySelectorAll("[data-direct-set]").forEach(button => button.addEventListener("click", () => openDirectSet(0)));
-  view.querySelectorAll("[data-send-unreal]").forEach(button => button.addEventListener("click", () => sendProductionToUnreal(state.production)));
-  view.querySelectorAll("[data-export-spec]").forEach(button => button.addEventListener("click", () => exportSceneSpec(state.production)));
-  view.querySelectorAll("[data-publish-asset]").forEach(button => button.addEventListener("click", openPublishAsset));
-  view.querySelectorAll("[data-end-cycle]").forEach(button => button.addEventListener("click", advanceCycle));
-  view.querySelectorAll("[data-world-prompt]").forEach(button => button.addEventListener("click", openWorldPrompt));
-  view.querySelectorAll("[data-invest-id]").forEach(button => button.addEventListener("click", () => investIn(button.dataset.investId)));
-  view.querySelectorAll("[data-filter]").forEach(button => button.addEventListener("click", () => { catalogFilter = button.dataset.filter; renderApp(); }));
-  view.querySelectorAll("[data-film-id]").forEach(card => {
+function bindViewEvents(root = view) {
+  root.querySelectorAll("[data-view-link]").forEach(button => button.addEventListener("click", () => setView(button.dataset.viewLink)));
+  root.querySelectorAll("[data-gig-id]").forEach(button => button.addEventListener("click", () => openGig(button.dataset.gigId)));
+  root.querySelectorAll("[data-greenlight]").forEach(button => button.addEventListener("click", openGreenlight));
+  root.querySelectorAll("[data-live-watch]").forEach(button => button.addEventListener("click", openLiveSet));
+  root.querySelectorAll("[data-production-stage]").forEach(button => button.addEventListener("click", openProductionStage));
+  root.querySelectorAll("[data-direct-set]").forEach(button => button.addEventListener("click", () => openDirectSet(0)));
+  root.querySelectorAll("[data-send-unreal]").forEach(button => button.addEventListener("click", () => sendProductionToUnreal(state.production)));
+  root.querySelectorAll("[data-export-spec]").forEach(button => button.addEventListener("click", () => exportSceneSpec(state.production)));
+  root.querySelectorAll("[data-publish-asset]").forEach(button => button.addEventListener("click", openPublishAsset));
+  root.querySelectorAll("[data-end-cycle]").forEach(button => button.addEventListener("click", advanceCycle));
+  root.querySelectorAll("[data-world-prompt]").forEach(button => button.addEventListener("click", openWorldPrompt));
+  root.querySelectorAll("[data-invest-id]").forEach(button => button.addEventListener("click", () => investIn(button.dataset.investId)));
+  root.querySelectorAll("[data-filter]").forEach(button => button.addEventListener("click", () => { catalogFilter = button.dataset.filter; renderApp(); }));
+  root.querySelectorAll("[data-film-id]").forEach(card => {
     card.addEventListener("click", () => openFilm(card.dataset.filmId));
     card.addEventListener("keydown", event => {
       if (event.key === "Enter" || event.key === " ") {
@@ -995,10 +1094,10 @@ function bindViewEvents() {
     });
   });
 
-  const refresh = view.querySelector("[data-refresh-board]");
+  const refresh = root.querySelector("[data-refresh-board]");
   if (refresh) refresh.addEventListener("click", refreshBoard);
 
-  const nextProject = view.querySelector("[data-new-project]");
+  const nextProject = root.querySelector("[data-new-project]");
   if (nextProject) nextProject.addEventListener("click", () => {
     state.production = null;
     saveState();
@@ -1008,6 +1107,7 @@ function bindViewEvents() {
 }
 
 function openDialog(markup) {
+  currentPanel = null;
   stopMotionPlayback();
   if (activeShootCleanup) {
     activeShootCleanup();
@@ -1029,6 +1129,17 @@ dialog.addEventListener("close", () => {
     activeShootCleanup = null;
   }
 });
+
+// ------------------------------------------------------------------
+// Gig flow: opening a gig, running the timing minigame, and scoring it.
+//
+// Three-step pipeline, each function handing off to the next:
+//   openGig()             — brief + multiple-choice creative quiz (modal form)
+//   startShootChallenge() — a timing minigame: hit a moving playhead inside a
+//                           target zone, once per "cue", three cues per gig
+//   completeGig()         — combines quiz correctness + timing accuracy into
+//                           a single 0–100 score and applies rewards
+// ------------------------------------------------------------------
 
 function openGig(gigId) {
   const gig = gigs.find(item => item.id === gigId);
@@ -1063,7 +1174,11 @@ function openGig(gigId) {
   form.addEventListener("submit", event => {
     event.preventDefault();
     const answers = gig.questions.map((question, index) => Number(new FormData(form).get(`q${index}`)));
-    startShootChallenge(gig, answers);
+    // The timing minigame (startShootChallenge) was cut from the gig flow:
+    // the brief alone decides the take, so execution mirrors the brief score.
+    const correct = answers.filter((answer, index) => answer === gig.questions[index].answer).length;
+    const briefScore = 34 + correct * 22;
+    completeGig(gig, answers, [briefScore, briefScore, briefScore]);
   });
 }
 
@@ -1200,6 +1315,13 @@ function startShootChallenge(gig, answers) {
   };
 }
 
+// Scoring: 3 quiz questions → creativeScore (34 base + 22 per correct
+// answer, so 0 correct = 34, 3/3 = 100), averaged timing minigame accuracy
+// (0-100 per cue, see markBeat() above) → timingScore, blended 65/35
+// creative-weighted into the final 0-100 `score`. That score then drives
+// credit/reputation payout, whether an asset draft or script unlocks
+// (>=72 / >=56 thresholds below), and feeds hasFlopStigma() via
+// lastReleaseScore for productions specifically.
 function completeGig(gig, answers, timingScores = [70, 70, 70]) {
   const correct = answers.filter((answer, index) => answer === gig.questions[index].answer).length;
   const creativeScore = 34 + correct * 22;
@@ -1491,6 +1613,14 @@ function openGreenlight() {
   });
 }
 
+// Walks the player through one productionStages[] entry per call, advancing
+// production.stage each time. Each locked choice adds choice.effect (plus a
+// +2 genre-fit bonus, see below) to production.quality, which is the running
+// score releaseProduction() eventually turns into audience reception. Once
+// production.stage passes the end of productionStages, this triggers
+// releaseProduction() automatically. Players can bypass the fixed options
+// via "improvise" (openStageImprovise) and get an AI-rated freeform score
+// instead of a fixed `effect`.
 function openProductionStage() {
   const production = state.production;
   if (!production || production.released) return;
@@ -1708,9 +1838,11 @@ function openDirectSet(selectedIndex = 0) {
 
 function openWorldPrompt() {
   state.worldPrompts = state.worldPrompts || [];
-  const history = state.worldPrompts.slice(-6).reverse().map(entry => `
+  const recent = state.worldPrompts.slice(-6).reverse();
+  const history = recent.map((entry, index) => `
     <div class="log-entry beat-entry">
       <strong>${escapeHTML(entry.title)}</strong> &mdash; ${entry.objects} objects, fog ${Number(entry.fog).toFixed(3)}
+      ${entry.spec ? `<button type="button" class="button compact" data-walk-history="${index}" style="float:right">&#9654; Walk</button>` : ""}
       <span class="log-note">${escapeHTML(entry.summary)}</span>
     </div>`).join("") || `<p class="subdued">Nothing generated yet. Describe any set you can imagine.</p>`;
   const paid = state.promptCycle === state.cycle;
@@ -1733,6 +1865,8 @@ function openWorldPrompt() {
       <div class="dialog-footer"><span class="text-small subdued">${TakeOneAI.status === "online" ? (TakeOneAI.healthInfo?.llm?.enabled ? "Live model connected" : "Adapter connected / local generator") : "Offline mode &mdash; browser generator active"}${paid ? " / +2 cr already earned this cycle" : " / +2 cr for your first prompt this cycle"}</span><button class="button primary" type="submit">Generate set</button></div>
     </form>`);
 
+  dialogContent.querySelectorAll("[data-walk-history]").forEach(button => button.addEventListener("click", () => openSetWalk(recent[Number(button.dataset.walkHistory)].spec)));
+
   document.getElementById("world-prompt-form").addEventListener("submit", async event => {
     event.preventDefault();
     const prompt = String(new FormData(event.currentTarget).get("prompt") || "").trim();
@@ -1748,9 +1882,12 @@ function openWorldPrompt() {
       title: scene.title || "Generated Set",
       summary: scene.summary || "",
       objects: Array.isArray(scene.objects) ? scene.objects.length : 0,
-      fog: scene.environment ? scene.environment.fog_density : 0
+      fog: scene.environment ? scene.environment.fog_density : 0,
+      spec: { title: scene.title, environment: scene.environment, objects: scene.objects }
     });
     state.worldPrompts = state.worldPrompts.slice(-12);
+    // Only the latest few keep their full spec, to keep the save small.
+    state.worldPrompts.slice(0, -6).forEach(entry => { delete entry.spec; });
 
     let rewardNote = "";
     if (state.promptCycle !== state.cycle) {
@@ -1770,12 +1907,21 @@ function openWorldPrompt() {
       "browser-offline": "browser generator (offline mode)"
     };
     preview.innerHTML = `
+      <canvas class="set-viewer" id="world-set-viewer" aria-label="3D preview of the generated set. Drag to orbit."></canvas>
+      <button type="button" class="button primary set-walk-button" id="walk-world-set">&#9654; Walk this set</button>
+      <button type="button" class="button set-walk-button" id="roblox-world-set">&#8681; Export to Roblox</button>
       <div class="log-entry">
         <strong>${escapeHTML(scene.title || "Generated Set")}</strong> <span class="log-note">built by ${escapeHTML(sourceLabels[scene.source] || "the world engine")}</span>
         <span class="log-note">${escapeHTML(scene.summary || "")}</span>
         ${(Array.isArray(scene.objects) ? scene.objects : []).slice(0, 6).map(obj => `<span class="log-note">&bull; ${escapeHTML(obj.label)} (${obj.primitive}) &mdash; ${escapeHTML(obj.asset_hint || "")}</span>`).join("")}
         <span class="log-note">${(Array.isArray(scene.objects) ? scene.objects.length : 0)} objects total.${rewardNote}</span>
       </div>`;
+    mountSetViewer(document.getElementById("world-set-viewer"), scene);
+    document.getElementById("walk-world-set").addEventListener("click", () => openSetWalk(scene));
+    document.getElementById("roblox-world-set").addEventListener("click", () => {
+      downloadRobloxSet(scene);
+      toast("Roblox script saved. Paste it into the Studio command bar to build the set.");
+    });
     submitButton.disabled = false;
     submitButton.textContent = "Generate again";
     toast(scene._fallback ? `Set generated locally.${rewardNote}` : `Set generated by the live model.${rewardNote}`);
@@ -1830,6 +1976,12 @@ async function openStageImprovise(stageName) {
   });
 }
 
+// Turns the accumulated production.quality (from openProductionStage() /
+// openStageImprovise() choices) plus crew quality and staffing gaps into a
+// final 30-97 `score`, then derives box-office gross, crew residuals (20%
+// cut, floored at the gross itself), and the director's net take. Also
+// pushes the finished film onto state.releases (which the Catalog view
+// reads) and publishes it to the shared world catalog via publishToWorld().
 function releaseProduction() {
   const production = state.production;
   const hiredCrew = production.hiredCrew || [];
@@ -2019,6 +2171,13 @@ function renderAiChip(status, info) {
   }
 }
 
+// ------------------------------------------------------------------
+// Bootstrap: runs once when the script loads. Wires the AI status chip,
+// health-checks the adapter (ai-client.js falls back gracefully either
+// way), assigns this browser a random director identity for the shared
+// world catalog on first run, starts polling for other players' releases,
+// then performs the first render.
+// ------------------------------------------------------------------
 if (window.TakeOneAI) {
   TakeOneAI.onStatusChange(renderAiChip);
   TakeOneAI.checkHealth().then(() => {
